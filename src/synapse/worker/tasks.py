@@ -33,6 +33,7 @@ from synapse.config import Settings
 from synapse.db import session_scope
 from synapse.db.models import Job, utcnow
 from synapse.events import emit as _emit
+from synapse.security import redact
 
 
 class TaskCancelled(Exception):
@@ -188,6 +189,10 @@ def ask_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]:
                 f"payload.context exceeds {ASK_MAX_CONTEXT_CHARS} characters (got {len(context)})"
             )
 
+    knowledge_flag = payload.get("knowledge", True)
+    if not isinstance(knowledge_flag, bool):
+        raise TaskFailure("payload.knowledge must be a boolean when provided")
+
     model = payload.get("model")
     if model is not None and not isinstance(model, str):
         raise TaskFailure("payload.model must be a string when provided")
@@ -201,6 +206,16 @@ def ask_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]:
         raise TaskFailure(f"payload.max_tokens must be between 1 and {ASK_MAX_TOKENS}")
 
     ctx.ensure_not_cancelled()
+
+    # Auto-grounding: with no explicit context, stored knowledge supplies it
+    # (ADR 0007). A retrieval failure must never fake a grounding: the ask
+    # proceeds ungrounded with an honest event trail and sources=[].
+    sources: list[dict[str, Any]] = []
+    if knowledge_flag and context is None:
+        retrieved, sources = _retrieve_knowledge_context(ctx, prompt)
+        if retrieved is not None:
+            context = retrieved
+
     ctx.emit("gateway_started", model=model or "default")
 
     messages = _build_ask_messages(prompt=prompt, context=context)
@@ -244,6 +259,9 @@ def ask_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]:
         "model": reply.model.model_id,
         "alias": reply.model.alias,
         "stop_reason": reply.stop_reason,
+        # Real provenance for any retrieved chunks: empty when the ask was
+        # ungrounded (retrieval off, no hits, or retrieval failed).
+        "sources": sources,
         "usage": {
             "input_tokens": reply.usage.input_tokens,
             "output_tokens": reply.usage.output_tokens,
@@ -254,6 +272,85 @@ def ask_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]:
             "attempts": reply.usage.attempts,
         },
     }
+
+
+ASK_CONTEXT_HITS = 5
+
+
+def _retrieve_knowledge_context(
+    ctx: TaskContext, prompt: str
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Search stored knowledge for chunks relevant to the prompt (ADR 0007).
+
+    Honesty rules:
+
+    - every hit keeps its real document/chunk ids, rank score, and retriever
+      label, so the answer can always be traced to what grounded it;
+    - a retrieval problem degrades to "ungrounded" with an event note, never
+      to fabricated context — and never fails the ask itself.
+    """
+    try:
+        from synapse.knowledge.embeddings import build_embeddings
+        from synapse.knowledge.search import search_hybrid
+
+        with session_scope(ctx.settings.database_url) as session:
+            embedder = build_embeddings()
+            vector = embedder.embed([prompt])[0]
+            hits = search_hybrid(
+                session, query=prompt, vector=vector, limit=ASK_CONTEXT_HITS
+            )
+    except Exception as exc:  # noqa: BLE001 - retrieval must not kill the ask
+        ctx.emit(
+            "knowledge_context_unavailable", reason=redact(str(exc))[:200] or "retrieval failed"
+        )
+        return None, []
+
+    if not hits:
+        return None, []
+
+    context = _assemble_knowledge_context(hits)
+    ctx.emit(
+        "knowledge_context_used",
+        hits=len(hits),
+        retriever=hits[0].retriever,
+        document_ids=list(dict.fromkeys(h.document_id for h in hits)),
+        total_chars=len(context),
+    )
+    sources = [
+        {
+            "document_id": hit.document_id,
+            "chunk_id": hit.chunk_id,
+            "chunk_index": hit.chunk_index,
+            "score": round(hit.score, 6),
+            "retriever": hit.retriever,
+            "source": hit.source,
+            "title": hit.title,
+        }
+        for hit in hits
+    ]
+    return context, sources
+
+
+def _assemble_knowledge_context(hits: list[Any]) -> str:
+    """Format retrieved chunks as provenance-labelled fenced context.
+
+    Truncates whole hits rather than slicing mid-chunk, so every source an
+    answer cites is present in the context verbatim.
+    """
+    parts: list[str] = []
+    used = 0
+    for index, hit in enumerate(hits, start=1):
+        title = hit.title or hit.source
+        header = (
+            f"[{index}] {title} · chunk {hit.chunk_index} · "
+            f"{hit.retriever} score {hit.score:.4f}"
+        )
+        allowance = ASK_MAX_CONTEXT_CHARS - (used + len(header) + 2)
+        if allowance <= 0:
+            break
+        parts.append(f"{header}\n{hit.content[:allowance]}")
+        used += len(header) + min(allowance, len(hit.content)) + 2
+    return "\n\n".join(parts)
 
 
 def _build_ask_messages(*, prompt: str, context: str | None) -> list[Any]:
@@ -304,6 +401,10 @@ def ingest_url_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]
     if not 1 <= max_chars <= INGEST_MAX_CHARS:
         raise TaskFailure(f"payload.max_chars must be between 1 and {INGEST_MAX_CHARS}")
 
+    store = payload.get("store", True)
+    if not isinstance(store, bool):
+        raise TaskFailure("payload.store must be a boolean when provided")
+
     ctx.ensure_not_cancelled()
     ctx.emit("fetch_started", url=url)
 
@@ -339,6 +440,20 @@ def ingest_url_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]
         chars=len(text),
     )
 
+    # Storage decision first: storing replaces the result's full-text copy
+    # (which would duplicate content already in `documents`) with a bounded
+    # preview. Nothing is invented: the complete text lives in the store and
+    # `text_truncated` says so.
+    stored: dict[str, Any] | None = None
+    if store:
+        stored = _store_in_knowledge(
+            ctx,
+            text=text,
+            source=result.url,
+            title=title or None,
+            content_type=result.content_type,
+        )
+    text_in_result = text if not store else text[:INGEST_RESULT_PREVIEW_CHARS]
     return {
         "url": url,
         "final_url": result.url,
@@ -346,7 +461,63 @@ def ingest_url_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]
         "content_type": result.content_type,
         "status_code": result.status_code,
         "chars": len(text),
-        "text": text,
+        "text": text_in_result,
+        "text_truncated": bool(store and len(text) > INGEST_RESULT_PREVIEW_CHARS),
+        # Real persistence facts: what landed in the knowledge store (ADR 0007).
+        # None when store was disabled — "not stored", never "stored with 0".
+        "knowledge": stored,
+    }
+
+
+INGEST_RESULT_PREVIEW_CHARS = 2_000
+
+
+def _store_in_knowledge(
+    ctx: TaskContext,
+    *,
+    text: str,
+    source: str,
+    title: str | None,
+    content_type: str | None,
+) -> dict[str, Any]:
+    """Persist fetched text via the one shared ingestion path (ADR 0005).
+
+    A fetch that cannot be stored fails the job: reporting "ingested" while
+    dropping the text would be a lie the user pays for later.
+    """
+    from synapse.knowledge.store import KnowledgeError, ingest_text
+
+    try:
+        with session_scope(ctx.settings.database_url) as session:
+            outcome = ingest_text(
+                session,
+                text=text,
+                source=source,
+                source_type="url",
+                title=title,
+                content_type=content_type,
+                ingested_by="worker",
+            )
+    except KnowledgeError as exc:
+        raise TaskFailure(f"knowledge store refused the document: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - storage failure must fail the job
+        raise TaskFailure(f"knowledge store failed: {redact(str(exc))}") from exc
+
+    if outcome.deduplicated:
+        ctx.emit("knowledge_deduplicated", document_id=outcome.document_id)
+    else:
+        ctx.emit(
+            "knowledge_stored",
+            document_id=outcome.document_id,
+            chunks=outcome.chunks,
+            characters=outcome.characters,
+        )
+    return {
+        "document_id": outcome.document_id,
+        "created": outcome.created,
+        "deduplicated": outcome.deduplicated,
+        "chunks": outcome.chunks,
+        "characters": outcome.characters,
     }
 
 

@@ -29,6 +29,16 @@ def synapse_home() -> Path:
     return Path(base) / "synapse"
 
 
+def dashboard_dist_dir() -> Path:
+    """Where the built dashboard assets live (``npm run build`` in ``dashboard/``).
+
+    Derived from this file's own location (``src/synapse/config.py`` → repo
+    root) so the API server and the CLI resolve the same folder from any
+    working directory, with a single source of truth.
+    """
+    return Path(__file__).resolve().parent.parent.parent / "dashboard" / "dist"
+
+
 @dataclass(frozen=True)
 class Settings:
     api_host: str

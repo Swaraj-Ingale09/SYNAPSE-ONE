@@ -23,35 +23,6 @@ from synapse.knowledge.embeddings import (
 from synapse.knowledge.search import SearchEmpty, search_hybrid
 from synapse.knowledge.store import KnowledgeError, content_digest, ingest_text
 
-
-@pytest.fixture
-def _clean_knowledge_tables(settings):
-    """Purge knowledge state around a DB-backed test.
-
-    ``conftest`` only cleans the job tables; documents are content-addressed,
-    so a leftover row would make a later "should create" assertion report a
-    spurious dedup. Cleanup runs *before* the test too, so a failed prior test
-    cannot cascade into confusing failures here.
-
-    Uses ``settings.database_url`` (the dedicated test DB) rather than
-    ``get_settings()``, which would read ``.env`` and wipe the *dev* database.
-
-    Deliberately not autouse: pure-function tests (chunking, hashing) must not
-    require a live database just to run.
-    """
-    from sqlalchemy import text
-
-    from synapse.db import session_scope
-
-    with session_scope(settings.database_url) as session:
-        session.execute(text("DELETE FROM chunks"))
-        session.execute(text("DELETE FROM documents"))
-    yield
-    with session_scope(settings.database_url) as session:
-        session.execute(text("DELETE FROM chunks"))
-        session.execute(text("DELETE FROM documents"))
-
-
 # --- chunking: exact provenance ----------------------------------------------
 
 

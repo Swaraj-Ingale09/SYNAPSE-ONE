@@ -34,3 +34,4 @@ out/
 # OS
 Thumbs.db
 Desktop.ini
+*.tsbuildinfo

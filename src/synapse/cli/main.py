@@ -14,6 +14,7 @@ import os
 import socket
 import sys
 import time
+import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,7 +37,7 @@ from synapse.cli.processes import (
     wait_for_log_line,
     write_pid_file,
 )
-from synapse.config import Settings, get_settings
+from synapse.config import Settings, dashboard_dist_dir, get_settings
 from synapse.contracts import TERMINAL_STATES, Job, JobStatus
 from synapse.security import ensure_token, redact
 
@@ -602,7 +603,9 @@ def _exit_for_job(job: Job) -> None:
 @app.command()
 def submit(
     ctx: typer.Context,
-    task_type: str = typer.Argument(..., help="Registered task type (echo, text_stats, slow)"),
+    task_type: str = typer.Argument(
+        ..., help="Registered task type (echo, text_stats, slow, ask, ingest_url)"
+    ),
     data: str = typer.Option("{}", "--data", help="JSON payload, e.g. '{\"text\": \"hi\"}'"),
     data_file: Path | None = typer.Option(
         None,
@@ -825,6 +828,208 @@ def events_cmd(
     except KeyboardInterrupt:
         if not state.json_output:
             console.print("[dim]Stopped following.[/dim]")
+
+
+# --- token / ask / ingest / dashboard --------------------------------------------
+
+
+@app.command()
+def token(ctx: typer.Context) -> None:
+    """Print the local access token the dashboard gate expects (ADR 0006)."""
+    state = _state(ctx)
+    settings = get_settings()
+    value = settings.token
+    if not value:
+        err_console.print("[red]✗ No access token exists yet.[/red]")
+        err_console.print("[dim]Run `synapse start` first — it generates one on first boot.[/dim]")
+        raise typer.Exit(EXIT_ERROR)
+
+    report = {"token": value, "token_file": str(settings.token_file)}
+
+    def render() -> None:
+        console.print(value)
+
+    _emit(state, report, render)
+
+
+def _submit_and_wait(
+    state: State,
+    settings: Settings,
+    task_type: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float | None,
+    project: str | None,
+) -> Job:
+    """Queue one job and stream its events to a terminal state (ask/ingest)."""
+    with _client_errors():
+        with SynapseClient(settings) as client:
+            created = client.create_job(task_type, payload=payload, project_scope=project)
+            return _wait_for_job(client, created.id, state, timeout)
+
+
+@app.command()
+def ask(
+    ctx: typer.Context,
+    prompt: str = typer.Argument(..., help="What to ask (max 32000 characters)"),
+    context: str | None = typer.Option(
+        None, "--context", help="Untrusted context; fenced out of the system prompt"
+    ),
+    model: str | None = typer.Option(None, "--model", help="Model override (routed by the core)"),
+    max_tokens: int | None = typer.Option(None, "--max-tokens", min=1, help="Output token cap"),
+    project: str | None = typer.Option(None, "--project", help="Job's project scope"),
+    timeout: float | None = typer.Option(None, "--timeout", help="Max seconds to wait"),
+) -> None:
+    """Ask the workstation a question and stream the real answer (task «ask»)."""
+    state = _state(ctx)
+    settings = get_settings()
+    if not prompt.strip():
+        # Same rule the worker enforces (tasks.ask_task) — reject locally to
+        # save the round-trip.
+        err_console.print("[red]✗ prompt must be a non-empty string[/red]")
+        raise typer.Exit(EXIT_ERROR)
+    payload: dict[str, Any] = {"prompt": prompt}
+    if context is not None:
+        payload["context"] = context
+    if model is not None:
+        payload["model"] = model
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    final = _submit_and_wait(
+        state, settings, "ask", payload, timeout=timeout, project=project
+    )
+
+    def render_final() -> None:
+        if final.status is not JobStatus.COMPLETED:
+            # Honest failure paths: no answer, no invented partial answer.
+            console.print(
+                f"[{'red' if final.status is JobStatus.FAILED else 'yellow'}]"
+                f"{final.status.value.upper()}"
+                f"[/{'red' if final.status is JobStatus.FAILED else 'yellow'}] "
+                f"job [bold]{final.id}[/bold]"
+            )
+        if final.error:
+            console.print(f"[red]error:[/red] {final.error}")
+        result = final.result or {}
+        text = result.get("text")
+        if text:
+            console.print(text)
+        if result:
+            usage = result.get("usage") or {}
+            cost = usage.get("cost_usd")
+            cost_text = "n/a (price unknown)" if cost is None else f"${cost:.6f}"
+            console.print(
+                f"[dim]{result.get('provider')}/{result.get('model')} · "
+                f"in {usage.get('input_tokens')} out {usage.get('output_tokens')} tok · "
+                f"{usage.get('latency_ms')} ms · {cost_text}[/dim]"
+            )
+            sources = result.get("sources") or []
+            if sources:
+                # Real provenance: which stored documents grounded this answer.
+                titles = ", ".join(
+                    f"{(s.get('title') or s.get('source') or '?')[:40]}" for s in sources
+                )
+                console.print(
+                    f"[dim]grounded by {len(sources)} chunk(s) "
+                    f"({sources[0].get('retriever')}): {titles}[/dim]"
+                )
+            else:
+                console.print("[dim]Not grounded — no knowledge matched this prompt.[/dim]")
+
+    if state.json_output:
+        typer.echo(final.model_dump_json())
+    else:
+        render_final()
+    _exit_for_job(final)
+
+
+@app.command()
+def ingest(
+    ctx: typer.Context,
+    url: str = typer.Argument(..., help="http(s) URL to fetch through the SSRF gate"),
+    max_chars: int | None = typer.Option(None, "--max-chars", min=1, help="Text size cap"),
+    project: str | None = typer.Option(None, "--project", help="Job's project scope"),
+    timeout: float | None = typer.Option(None, "--timeout", help="Max seconds to wait"),
+) -> None:
+    """Fetch a URL through the SSRF gate and store its text in knowledge (task «ingest_url»)."""
+    state = _state(ctx)
+    settings = get_settings()
+    payload: dict[str, Any] = {"url": url}
+    if max_chars is not None:
+        payload["max_chars"] = max_chars
+
+    final = _submit_and_wait(
+        state, settings, "ingest_url", payload, timeout=timeout, project=project
+    )
+
+    def render_final() -> None:
+        if final.status is not JobStatus.COMPLETED:
+            console.print(
+                f"[yellow]{final.status.value.upper()}[/yellow] job [bold]{final.id}[/bold]"
+            )
+        if final.error:
+            console.print(f"[red]error:[/red] {final.error}")
+        result = final.result or {}
+        title = result.get("title") or result.get("final_url") or url
+        if result:
+            console.print(
+                f"[green]✓[/green] [bold]{title}[/bold] — {result.get('chars')} chars "
+                f"[dim]({result.get('content_type')}, HTTP {result.get('status_code')})[/dim]"
+            )
+            knowledge = result.get("knowledge")
+            if knowledge:
+                if knowledge.get("deduplicated"):
+                    console.print(
+                        f"[dim]Already known: document "
+                        f"{str(knowledge.get('document_id'))[:8]} "
+                        f"(content-identical, no new chunks)[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"[dim]Stored in knowledge: document "
+                        f"{str(knowledge.get('document_id'))[:8]} · "
+                        f"{knowledge.get('chunks')} chunks[/dim]"
+                    )
+            else:
+                console.print(
+                    "[dim]Not stored (store disabled) — full text in the job result: "
+                    f"synapse job inspect {final.id}[/dim]"
+                )
+
+    if state.json_output:
+        typer.echo(final.model_dump_json())
+    else:
+        render_final()
+    _exit_for_job(final)
+
+
+@app.command()
+def dashboard(ctx: typer.Context) -> None:
+    """Open the live dashboard in a browser, starting the core first if needed."""
+    state = _state(ctx)
+    settings = get_settings()
+    index_file = dashboard_dist_dir() / "index.html"
+    if not index_file.exists():
+        err_console.print(f"[red]✗ Dashboard assets are not built ({index_file} missing)[/red]")
+        err_console.print("[dim]Build them once with: npm run build (in dashboard/)[/dim]")
+        raise typer.Exit(EXIT_ERROR)
+
+    if not _health_ok(settings):
+        console.print("[dim]Core is not running — starting it first…[/dim]")
+        start(ctx)
+
+    url = f"{settings.api_url}/"
+    report = {"url": url, "token_hint": "run `synapse token` to read the access token"}
+    opened = webbrowser.open(url)
+
+    def render() -> None:
+        console.print(f"[green]✓[/green] Dashboard live at [bold]{url}[/bold]")
+        console.print("[dim]Paste the access token at the gate — read it with: synapse token[/dim]")
+
+    _emit(state, report, render)
+    if not opened:
+        err_console.print("[yellow]⚠ Could not launch a browser — open the URL manually.[/yellow]")
 
 
 def main() -> None:

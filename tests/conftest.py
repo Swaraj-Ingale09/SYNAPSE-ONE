@@ -50,9 +50,15 @@ def test_db_url() -> str:
 
 @pytest.fixture(autouse=True)
 def _clean_job_tables(test_db_url: str):
-    """Isolate tests: purge job state after every test (sequences keep counting)."""
+    """Isolate tests: purge durable state after every test (sequences keep counting).
+
+    ``model_usage`` is included because its FK is ``SET NULL``: deleting jobs
+    alone would leave orphaned ledger rows that leak into the next test's
+    "no calls recorded" assertions.
+    """
     yield
     with session_scope(test_db_url) as session:
+        session.execute(text("DELETE FROM model_usage"))
         session.execute(text("DELETE FROM job_events"))
         session.execute(text("DELETE FROM jobs"))
 
@@ -69,6 +75,34 @@ def settings(test_db_url: str, tmp_path, monkeypatch) -> Settings:
         token="test-token-value",
         state_dir=state,
     )
+
+
+@pytest.fixture
+def _clean_knowledge_tables(settings):
+    """Purge knowledge state around a DB-backed test (shared by several modules).
+
+    ``_clean_job_tables`` only cleans the job tables; documents are
+    content-addressed, so a leftover row would make a later "should create"
+    assertion report a spurious dedup. Cleanup runs *before* the test too, so a
+    failed prior test cannot cascade into confusing failures here.
+
+    Uses ``settings.database_url`` (the dedicated test DB) rather than
+    ``get_settings()``, which would read ``.env`` and wipe the *dev* database.
+
+    Deliberately not autouse: pure-function tests (chunking, hashing) must not
+    require a live database just to run.
+    """
+    from sqlalchemy import text
+
+    from synapse.db import session_scope
+
+    with session_scope(settings.database_url) as session:
+        session.execute(text("DELETE FROM chunks"))
+        session.execute(text("DELETE FROM documents"))
+    yield
+    with session_scope(settings.database_url) as session:
+        session.execute(text("DELETE FROM chunks"))
+        session.execute(text("DELETE FROM documents"))
 
 
 @pytest.fixture
