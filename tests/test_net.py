@@ -12,7 +12,7 @@ import ipaddress
 import httpx
 import pytest
 
-from synapse.net.fetch import FetchBlocked, FetchFailed, SafeFetcher
+from synapse.net.fetch import FetchBlocked, FetchFailed, FetchHTTPError, SafeFetcher
 from synapse.net.ssrf import (
     EgressBlocked,
     assert_safe_ip,
@@ -279,4 +279,50 @@ def test_http_error_status_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     fetcher = _build(monkeypatch, handler)
     with pytest.raises(FetchFailed, match="HTTP 500"):
         fetcher.fetch("http://down.example.com/page")
+    fetcher.close()
+
+
+# --- fetcher: HTTP errors expose what rate-aware callers need (ADR 0008) -------------
+
+
+def test_http_error_carries_status_headers_and_body_snippet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connectors must see 429 + Retry-After, not a flattened string message."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(
+            429,
+            headers={"retry-after": "3", "x-ratelimit-remaining": "0"},
+            text="slow down a moment",
+        )
+
+    fetcher = _build(monkeypatch, handler)
+    with pytest.raises(FetchHTTPError) as excinfo:
+        fetcher.fetch("http://api.example.com/data")
+    error = excinfo.value
+    assert isinstance(error, FetchFailed)  # existing except-clauses keep working
+    assert error.status_code == 429
+    assert error.headers["retry-after"] == "3"
+    assert error.headers["x-ratelimit-remaining"] == "0"
+    assert "slow down a moment" in error.body_snippet
+    fetcher.close()
+
+
+def test_success_result_exposes_response_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            text="payload",
+            headers={"content-type": "text/plain", "x-ratelimit-limit": "10"},
+        )
+
+    fetcher = _build(monkeypatch, handler)
+    result = fetcher.fetch("http://api.example.com/data")
+    assert result.headers["x-ratelimit-limit"] == "10"  # keys are lowercase
+    assert result.headers["content-type"] == "text/plain"
     fetcher.close()

@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from urllib import robotparser
 from urllib.parse import urljoin, urlsplit
 
@@ -56,6 +57,29 @@ class FetchFailed(RuntimeError):
     """The fetch was permitted but failed (network, HTTP status, size, type)."""
 
 
+class FetchHTTPError(FetchFailed):
+    """The server answered with a non-200 status.
+
+    Carries what rate-aware callers need to react honestly: the status code,
+    lowercase response headers (``retry-after``, ``x-ratelimit-*``), and a
+    bounded snippet of the body for error detail. A plain ``FetchFailed``
+    except clause still catches it (ADR 0008).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        headers: Mapping[str, str],
+        body_snippet: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.headers = dict(headers)
+        self.body_snippet = body_snippet
+
+
 @dataclass(frozen=True)
 class FetchResult:
     url: str  # final URL after redirects
@@ -64,6 +88,7 @@ class FetchResult:
     text: str
     bytes_read: int
     from_cache: bool = False
+    headers: Mapping[str, str] = field(default_factory=dict)  # lowercase keys
 
 
 def _content_type_base(header_value: str) -> str:
@@ -174,7 +199,17 @@ class SafeFetcher:
                 continue
 
             if response.status_code != 200:
-                raise FetchFailed(f"{current} returned HTTP {response.status_code}")
+                charset = response.charset_encoding or "utf-8"
+                try:
+                    snippet = response.content[:512].decode(charset, errors="replace")
+                except LookupError:
+                    snippet = response.content[:512].decode("utf-8", errors="replace")
+                raise FetchHTTPError(
+                    f"{current} returned HTTP {response.status_code}",
+                    status_code=response.status_code,
+                    headers={k.lower(): v for k, v in response.headers.items()},
+                    body_snippet=snippet,
+                )
 
             content_type = _content_type_base(response.headers.get("content-type", ""))
             if content_type and content_type not in ALLOWED_CONTENT_TYPES:
@@ -208,10 +243,12 @@ class SafeFetcher:
                 content_type=content_type or "application/octet-stream",
                 text=text,
                 bytes_read=len(data),
+                headers={k.lower(): v for k, v in response.headers.items()},
             )
 
         raise FetchFailed(f"too many redirects (>{MAX_REDIRECTS}) fetching {url}")
 
 
-def build_fetcher(settings: Settings) -> SafeFetcher:
-    return SafeFetcher(settings)
+def build_fetcher(settings: Settings, *, min_interval_seconds: float = 1.0) -> SafeFetcher:
+    """One fetcher per caller; ``min_interval_seconds`` sets its politeness floor."""
+    return SafeFetcher(settings, min_interval_seconds=min_interval_seconds)

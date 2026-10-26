@@ -17,13 +17,14 @@ import time
 import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from synapse import __version__
@@ -38,6 +39,7 @@ from synapse.cli.processes import (
     write_pid_file,
 )
 from synapse.config import Settings, dashboard_dist_dir, get_settings
+from synapse.connectors import ConnectorError, build_connector, connector_catalog
 from synapse.contracts import TERMINAL_STATES, Job, JobStatus
 from synapse.security import ensure_token, redact
 
@@ -1030,6 +1032,86 @@ def dashboard(ctx: typer.Context) -> None:
     _emit(state, report, render)
     if not opened:
         err_console.print("[yellow]⚠ Could not launch a browser — open the URL manually.[/yellow]")
+
+
+@app.command()
+def search(
+    ctx: typer.Context,
+    connector: str | None = typer.Argument(
+        None, help="Connector name — omit it to list every connector"
+    ),
+    query: str = typer.Argument(
+        "", help="Search text (usgs takes key=value filters; frankfurter takes a currency code)"
+    ),
+    limit: int = typer.Option(10, "--limit", min=1, max=500, help="Max items to show"),
+) -> None:
+    """Search a free public API: coding, knowledge, medical, earth, weather, finance.
+
+    Runs directly against the verified provider through the SSRF gate — no core
+    required. Failures print the real reason (rate_limited, blocked, …), never
+    an empty-looking success.
+    """
+    state = _state(ctx)
+    if connector is None:
+        def render_catalog() -> None:
+            table = Table(title="Connectors — free public APIs")
+            table.add_column("NAME", style="cyan")
+            table.add_column("DOMAIN")
+            table.add_column("SOURCE")
+            for entry in connector_catalog():
+                table.add_row(entry["name"], entry["domain"], entry["description"])
+            console.print(table)
+
+        _emit(state, connector_catalog(), render_catalog)
+        return
+
+    settings = get_settings()
+    try:
+        with build_connector(connector, settings) as active:
+            response = active.search(query, limit=limit)
+    except ConnectorError as exc:
+        err_console.print(f"[red]✗ {exc.reason}[/red]: {exc.detail}")
+        raise typer.Exit(EXIT_ERROR) from None
+
+    def render() -> None:
+        total = (
+            "total n/a (this API reports no total)"
+            if response.total is None
+            else f"total {response.total}"
+        )
+        console.print(
+            f"[bold]{response.connector}[/bold] ({response.domain}) — "
+            f"{len(response.items)} shown · {total}"
+        )
+        if response.requested > response.page_size:
+            console.print(
+                f"[yellow]·[/yellow] --limit {response.requested} trimmed to "
+                f"{response.page_size} (connector page cap)"
+            )
+        rate = response.rate
+        if rate is None:
+            console.print("[dim]· rate limit: not reported by this API[/dim]")
+        else:
+            remaining = "n/a" if rate.remaining is None else str(rate.remaining)
+            ceiling = "n/a" if rate.limit is None else str(rate.limit)
+            console.print(
+                f"[dim]· rate limit: {remaining}/{ceiling} remaining "
+                f"(reported via {rate.source})[/dim]"
+            )
+        for index, item in enumerate(response.items, start=1):
+            console.print(f"[cyan]{index}.[/cyan] {escape(item.title)}")
+            meta = " · ".join(part for part in (item.date, item.url) if part)
+            if meta:
+                console.print(f"   [dim]{escape(meta)}[/dim]")
+            if item.snippet:
+                console.print(f"   {escape(item.snippet)}")
+            if item.facts:
+                rendered = " · ".join(f"{key}={escape(value)}" for key, value in item.facts)
+                console.print(f"   [dim]{rendered}[/dim]")
+        if not response.items:
+            console.print("[dim]No results matched — an empty result, not an error.[/dim]")
+
+    _emit(state, asdict(response), render)
 
 
 def main() -> None:

@@ -22,7 +22,7 @@ def test_help_lists_real_commands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     for command in ("start", "stop", "status", "doctor", "submit", "jobs", "events",
-                    "token", "ask", "ingest", "dashboard"):
+                    "token", "ask", "ingest", "dashboard", "search"):
         assert command in result.output
 
 
@@ -113,3 +113,120 @@ def test_ask_rejects_empty_prompt_before_contacting_core(isolated_env) -> None:
 
     assert result.exit_code == 1
     assert "non-empty" in result.output
+
+
+# --- search (ADR 0008: free public-API connectors) --------------------------------------
+
+
+def test_search_without_connector_lists_them_all(isolated_env) -> None:
+    """No argument = the catalog. Every registered connector is discoverable."""
+    result = runner.invoke(app, ["search"])
+
+    assert result.exit_code == 0
+    for name in ("github", "stackoverflow", "openalex", "crossref",
+                 "europepmc", "usgs", "weather", "frankfurter"):
+        assert name in result.output
+
+
+def test_search_json_catalog_is_machine_readable(isolated_env) -> None:
+    import json
+
+    result = runner.invoke(app, ["--json", "search"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert {row["name"] for row in payload} >= {"github", "europepmc", "frankfurter"}
+
+
+def test_search_unknown_connector_exits_with_the_real_names() -> None:
+    """A typo must say so and list the truth — never render an empty 'success'."""
+    result = runner.invoke(app, ["search", "wikipedia", "something"])
+
+    assert result.exit_code == 1
+    assert "unknown connector" in result.output
+    assert "github" in result.output
+
+
+def test_search_empty_query_is_rejected_locally(isolated_env) -> None:
+    """`search github` with no query fails before any network or core involvement."""
+    result = runner.invoke(app, ["search", "github"])
+
+    assert result.exit_code == 1
+    assert "invalid_query" in result.output
+    assert "non-empty" in result.output
+
+
+def _fake_connector_factory(response=None, error=None):
+    class _FakeConnector:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def search(self, query, *, limit=10):
+            if error is not None:
+                raise error
+            return response
+
+    return lambda name, settings: _FakeConnector()
+
+
+def test_search_renders_results_and_json(isolated_env, monkeypatch) -> None:
+    import json
+
+    from synapse.connectors import RateLimit, ResultItem, SearchResponse
+
+    response = SearchResponse(
+        connector="github",
+        domain="coding",
+        query="rag",
+        requested=10,
+        page_size=10,
+        items=(
+            ResultItem(
+                title="pypa/sampleproject",
+                url="https://github.com/pypa/sampleproject",
+                date="2026-01-02T03:04:05Z",
+                snippet="Example project",
+                facts=(("stars", "42"), ("language", "n/a")),
+            ),
+        ),
+        total=1,
+        fetched_at="2026-10-25T12:00:00+00:00",
+        rate=RateLimit(limit=10, remaining=9, source="headers"),
+    )
+    monkeypatch.setattr(
+        "synapse.cli.main.build_connector", _fake_connector_factory(response=response)
+    )
+
+    result = runner.invoke(app, ["search", "github", "rag"])
+    assert result.exit_code == 0
+    assert "pypa/sampleproject" in result.output
+    assert "10/10" not in result.output  # rate renders as reported: 9 remaining of 10
+    assert "9/10" in result.output
+    assert "language=n/a" in result.output  # absent fact stays n/a, not 0
+
+    json_result = runner.invoke(app, ["--json", "search", "github", "rag"])
+    assert json_result.exit_code == 0
+    payload = json.loads(json_result.output)
+    assert payload["connector"] == "github"
+    assert payload["items"][0]["title"] == "pypa/sampleproject"
+    assert payload["items"][0]["facts"][1] == ["language", "n/a"]  # tuples → JSON arrays
+    assert payload["total"] == 1
+    assert payload["rate"] == {"limit": 10, "remaining": 9, "source": "headers"}
+
+
+def test_search_failure_prints_the_real_reason(isolated_env, monkeypatch) -> None:
+    from synapse.connectors import ConnectorError
+
+    error = ConnectorError(
+        "rate_limited", "github is rate limited (HTTP 429); server says wait 60s"
+    )
+    monkeypatch.setattr("synapse.cli.main.build_connector", _fake_connector_factory(error=error))
+
+    result = runner.invoke(app, ["search", "github", "rag"])
+
+    assert result.exit_code == 1
+    assert "rate_limited" in result.output
+    assert "wait 60s" in result.output
