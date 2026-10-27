@@ -66,6 +66,18 @@ Built-in Phase 1 tasks: `echo`, `text_stats`, `slow` (cancellable, used to prove
 lifecycle behaviour). Model-backed tasks (`ask`, `research`, `code`) arrive in Phase 2
 with the model gateway — they are **not** faked.
 
+## MCP clients
+
+The MCP server exposes the running core to MCP-compatible hosts over stdio:
+
+```powershell
+synapse mcp --print-config
+```
+
+Add the printed configuration to your MCP host. The host launches `synapse mcp`;
+the server uses the local token without printing it. Start the core with
+`synapse start` before connecting.
+
 ## Architecture
 
 ```
@@ -77,7 +89,8 @@ src/synapse/
 ├── worker/           # durable job loop: claim (SKIP LOCKED), execute, recover
 ├── db/               # SQLAlchemy models + packaged Alembic migrations
 ├── security/         # bearer token + secret redaction (spec 15.2)
-└── cli/              # typer CLI: thin client over the gateway (spec 10.1)
+├── cli/              # typer CLI: thin client over the gateway (spec 10.1)
+└── mcp/              # JSON-RPC 2.0 stdio server and bounded MCP tools
 ```
 
 Key guarantees implemented in this phase:

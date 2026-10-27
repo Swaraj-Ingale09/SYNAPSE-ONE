@@ -119,6 +119,22 @@ class SynapseClient:
         ).json()
         return [JobEvent.model_validate(item) for item in data]
 
+    # --- search (sync surface, ADR 0009) ------------------------------------
+
+    def connector_catalog(self) -> list[dict[str, Any]]:
+        data = self._request("GET", "/v1/search/connectors").json()
+        return list(data.get("connectors") or [])
+
+    def search(
+        self, connector: str, query: str, limit: int = 10
+    ) -> dict[str, Any]:
+        data = self._request(
+            "POST",
+            "/v1/search",
+            json={"connector": connector, "query": query, "limit": limit},
+        ).json()
+        return dict(data)
+
     # --- writes -----------------------------------------------------------
 
     def create_job(

@@ -1327,6 +1327,60 @@ def research(
     _exit_for_job(final)
 
 
+def _mcp_client_config() -> dict[str, Any]:
+    """The JSON an MCP host needs to launch ``synapse mcp`` as a stdio server.
+
+    The token is never printed (spec 5): the launched server reads it from the
+    same state file every other local client uses.
+    """
+    return {
+        "mcpServers": {
+            "synapse": {
+                "command": "synapse",
+                "args": ["mcp"],
+            }
+        }
+    }
+
+
+@app.command()
+def mcp(
+    ctx: typer.Context,
+    print_config: bool = typer.Option(
+        False,
+        "--print-config",
+        help="Print MCP host configuration JSON (for Claude/Cursor/etc.) and exit",
+    ),
+) -> None:
+    """Serve the core to MCP clients over stdio — every MCP host becomes a thin client."""
+    state = _state(ctx)
+    settings = get_settings()
+
+    if print_config:
+        if state.json_output:
+            typer.echo(json.dumps(_mcp_client_config()))
+        else:
+            console.print_json(json.dumps(_mcp_client_config()))
+            console.print(
+                "\n[dim]Add this to your MCP host's config. The server reads the "
+                "local token automatically — it is never printed.[/dim]"
+            )
+        return
+
+    # Stdio transport: stdout belongs to the protocol, so the console goes to
+    # stderr. A missing token is caught before the first tool call, with the
+    # real reason (the API would answer 401 anyway — fail fast, fail honest).
+    if not settings.token:
+        err_console.print(
+            "[red]✗ no client token found — run `synapse start` once to create it[/red]"
+        )
+        raise typer.Exit(EXIT_NOT_RUNNING)
+
+    from synapse.mcp import run_mcp_server
+
+    raise typer.Exit(run_mcp_server(settings))
+
+
 def main() -> None:
     app()
 
