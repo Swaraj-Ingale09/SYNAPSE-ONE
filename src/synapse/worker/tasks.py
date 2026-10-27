@@ -35,6 +35,15 @@ from synapse.connectors import ConnectorError, build_connector
 from synapse.db import session_scope
 from synapse.db.models import Job, utcnow
 from synapse.events import emit as _emit
+from synapse.gateway import GatewayError, NoProviderConfigured
+from synapse.research import (
+    DEFAULT_RESEARCH_CONNECTORS,
+    RESEARCH_DEFAULT_SOURCES,
+    RESEARCH_MAX_QUESTION_CHARS,
+    RESEARCH_MAX_SOURCES,
+    ResearchError,
+    run_research,
+)
 from synapse.security import redact
 
 
@@ -565,6 +574,85 @@ def search_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]:
     return dataclasses.asdict(response)
 
 
+def research_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]:
+    """Evidence-first research: search, fetch, then synthesise (ADR 0010).
+
+    The pipeline lives in :mod:`synapse.research` (testable without a
+    database); this wrapper validates the payload and maps every failure
+    class to an honest ``TaskFailure`` carrying its stable reason.
+    """
+    question = payload.get("question")
+    if not isinstance(question, str) or not question.strip():
+        raise TaskFailure("payload.question must be a non-empty string")
+    question = question.strip()
+    if len(question) > RESEARCH_MAX_QUESTION_CHARS:
+        raise TaskFailure(
+            f"payload.question exceeds {RESEARCH_MAX_QUESTION_CHARS} characters "
+            f"(got {len(question)})"
+        )
+
+    raw_connectors = payload.get("connectors")
+    if raw_connectors is None:
+        connectors = list(DEFAULT_RESEARCH_CONNECTORS)
+    else:
+        if not isinstance(raw_connectors, list | tuple) or not raw_connectors:
+            raise TaskFailure(
+                "payload.connectors must be a non-empty list of connector names"
+            )
+        connectors = []
+        for entry in raw_connectors:
+            if not isinstance(entry, str) or not entry.strip():
+                raise TaskFailure(
+                    "payload.connectors entries must be non-empty strings"
+                )
+            connectors.append(entry.strip().lower())
+
+    raw_sources = payload.get("max_sources", RESEARCH_DEFAULT_SOURCES)
+    if isinstance(raw_sources, bool) or not isinstance(raw_sources, int):
+        raise TaskFailure(
+            f"payload.max_sources must be an integer between 1 and {RESEARCH_MAX_SOURCES}"
+        )
+    if not 1 <= raw_sources <= RESEARCH_MAX_SOURCES:
+        raise TaskFailure(
+            f"payload.max_sources must be an integer between 1 and {RESEARCH_MAX_SOURCES}"
+        )
+
+    model = payload.get("model")
+    if model is not None and not isinstance(model, str):
+        raise TaskFailure("payload.model must be a string when provided")
+
+    raw_max_tokens = payload.get("max_tokens", ASK_MAX_TOKENS)
+    try:
+        max_tokens = int(raw_max_tokens)
+    except (TypeError, ValueError) as exc:
+        raise TaskFailure("payload.max_tokens must be an integer") from exc
+    if not 1 <= max_tokens <= ASK_MAX_TOKENS:
+        raise TaskFailure(f"payload.max_tokens must be between 1 and {ASK_MAX_TOKENS}")
+
+    ctx.ensure_not_cancelled()
+    try:
+        return run_research(
+            question=question,
+            settings=ctx.settings,
+            connectors=connectors,
+            max_sources=raw_sources,
+            model=model,
+            max_tokens=max_tokens,
+            job_id=ctx.job_id,
+            progress=ctx.emit,
+            check_cancelled=ctx.ensure_not_cancelled,
+        )
+    except ConnectorError as exc:
+        raise TaskFailure(f"{exc.reason}: {exc.detail}") from None
+    except ResearchError as exc:
+        raise TaskFailure(f"{exc.reason}: {exc.detail}") from None
+    except NoProviderConfigured as exc:
+        # The honest failure the spec demands: no key, no answer.
+        raise TaskFailure(str(exc)) from exc
+    except GatewayError as exc:
+        raise TaskFailure(f"model gateway failed: {exc}") from exc
+
+
 TASKS: dict[str, TaskFunc] = {
     "echo": echo_task,
     "text_stats": text_stats_task,
@@ -572,4 +660,5 @@ TASKS: dict[str, TaskFunc] = {
     "ask": ask_task,
     "ingest_url": ingest_url_task,
     "search": search_task,
+    "research": research_task,
 }

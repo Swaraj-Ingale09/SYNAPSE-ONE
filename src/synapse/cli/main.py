@@ -39,8 +39,19 @@ from synapse.cli.processes import (
     write_pid_file,
 )
 from synapse.config import Settings, dashboard_dist_dir, get_settings
-from synapse.connectors import ConnectorError, build_connector, connector_catalog
+from synapse.connectors import (
+    ConnectorError,
+    build_connector,
+    connector_catalog,
+    connector_names,
+)
 from synapse.contracts import TERMINAL_STATES, Job, JobStatus
+from synapse.research import (
+    DEFAULT_RESEARCH_CONNECTORS,
+    RESEARCH_DEFAULT_SOURCES,
+    RESEARCH_MAX_QUESTION_CHARS,
+    RESEARCH_MAX_SOURCES,
+)
 from synapse.security import ensure_token, redact
 
 EXIT_OK = 0
@@ -606,7 +617,7 @@ def _exit_for_job(job: Job) -> None:
 def submit(
     ctx: typer.Context,
     task_type: str = typer.Argument(
-        ..., help="Registered task type (echo, text_stats, slow, ask, ingest_url, search)"
+        ..., help="Registered task type (echo, text_stats, slow, ask, ingest_url, search, research)"
     ),
     data: str = typer.Option("{}", "--data", help="JSON payload, e.g. '{\"text\": \"hi\"}'"),
     data_file: Path | None = typer.Option(
@@ -1169,6 +1180,151 @@ def search(
         _render_search_result(asdict(response))
 
     _emit(state, asdict(response), render)
+
+
+def _render_research_result(result: dict[str, Any]) -> None:
+    """Render a research job's result — the answer first, then real provenance.
+
+    Reads only dict keys (the job result arrives JSON-round-tripped). Every
+    value below came from the pipeline: sources are what actually entered the
+    model's prompt, and a "total n/a" is a provider that reports no count.
+    """
+    answer = result.get("answer")
+    if answer:
+        console.print(answer)
+
+    sources = result.get("sources") or []
+    if sources:
+        console.print("\n[bold]Sources[/bold]")
+        for source in sources:
+            index = source.get("index", "?")
+            title = source.get("title") or source.get("url") or "untitled"
+            console.print(f" [cyan][{index}][/cyan] {escape(str(title))}")
+            if source.get("url"):
+                console.print(f"     [dim]{escape(str(source['url']))}[/dim]")
+            bits = [f"via {source.get('connector')}"]
+            if source.get("via"):
+                bits.append(str(source["via"]))
+            if source.get("chars") is not None:
+                bits.append(f"{source['chars']} chars")
+            if source.get("status_code") is not None:
+                bits.append(f"HTTP {source['status_code']}")
+            console.print(f"     [dim]{escape(' · '.join(bits))}[/dim]")
+
+    searches = result.get("searches") or []
+    if searches:
+        console.print("\n[bold]Searches[/bold]")
+        for entry in searches:
+            name = entry.get("connector")
+            error = entry.get("error")
+            if error:
+                console.print(
+                    f" [red]✗[/red] {name} — {error.get('reason')}: {error.get('detail')}"
+                )
+            else:
+                total = entry.get("total")
+                total_text = "total n/a" if total is None else f"total {total:,}"
+                console.print(
+                    f" [green]✓[/green] {name} — {entry.get('fetched')} result(s), {total_text}"
+                )
+
+    skipped = result.get("fetch_skipped") or []
+    if skipped:
+        console.print("\n[yellow]Not fetched[/yellow]")
+        for entry in skipped:
+            console.print(
+                f" [dim]{escape(str(entry.get('url')))} — "
+                f"{escape(str(entry.get('reason')))}[/dim]"
+            )
+
+    usage = result.get("usage") or {}
+    cost = usage.get("cost_usd")
+    cost_text = "n/a (price unknown)" if cost is None else f"${cost:.6f}"
+    console.print(
+        f"\n[dim]{result.get('provider')}/{result.get('model')} · "
+        f"in {usage.get('input_tokens')} out {usage.get('output_tokens')} tok · "
+        f"{usage.get('latency_ms')} ms · {cost_text}[/dim]"
+    )
+
+
+@app.command()
+def research(
+    ctx: typer.Context,
+    question: str = typer.Argument(..., help="The research question"),
+    connectors: str | None = typer.Option(
+        None,
+        "--connectors",
+        help=(
+            "Comma-separated connector names "
+            f"(default: {', '.join(DEFAULT_RESEARCH_CONNECTORS)})"
+        ),
+    ),
+    max_sources: int = typer.Option(
+        RESEARCH_DEFAULT_SOURCES,
+        "--max-sources",
+        min=1,
+        max=RESEARCH_MAX_SOURCES,
+        help="How many sources to fetch as evidence",
+    ),
+    model: str | None = typer.Option(None, "--model", help="Model override (routed by the core)"),
+    max_tokens: int | None = typer.Option(None, "--max-tokens", min=1, help="Output token cap"),
+    project: str | None = typer.Option(None, "--project", help="Job's project scope"),
+    timeout: float | None = typer.Option(None, "--timeout", help="Max seconds to wait"),
+) -> None:
+    """Research a question: search free APIs, fetch sources, cite an answer (task «research»)."""
+    state = _state(ctx)
+    settings = get_settings()
+
+    cleaned = question.strip()
+    if not cleaned:
+        # Same rule the worker enforces (tasks.research_task) — reject locally.
+        err_console.print("[red]✗ question must be a non-empty string[/red]")
+        raise typer.Exit(EXIT_ERROR)
+    if len(cleaned) > RESEARCH_MAX_QUESTION_CHARS:
+        err_console.print(
+            f"[red]✗ question exceeds {RESEARCH_MAX_QUESTION_CHARS} characters "
+            f"(got {len(cleaned)})[/red]"
+        )
+        raise typer.Exit(EXIT_ERROR)
+
+    payload: dict[str, Any] = {"question": cleaned, "max_sources": max_sources}
+    if connectors is not None:
+        names = [part.strip().lower() for part in connectors.split(",") if part.strip()]
+        if not names:
+            err_console.print("[red]✗ --connectors needs at least one name[/red]")
+            raise typer.Exit(EXIT_ERROR)
+        unknown = [name for name in names if name not in connector_names()]
+        if unknown:
+            err_console.print(f"[red]✗ unknown connector(s): {', '.join(unknown)}[/red]")
+            err_console.print(f"available: {', '.join(connector_names())}")
+            raise typer.Exit(EXIT_ERROR)
+        payload["connectors"] = names
+    if model is not None:
+        payload["model"] = model
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    final = _submit_and_wait(
+        state, settings, "research", payload, timeout=timeout, project=project
+    )
+
+    def render() -> None:
+        if final.status is not JobStatus.COMPLETED:
+            # Honest failure paths: no answer, no invented partial answer.
+            color = "red" if final.status is JobStatus.FAILED else "yellow"
+            console.print(
+                f"[{color}]{final.status.value.upper()}[/{color}] job [bold]{final.id}[/bold]"
+            )
+        if final.error:
+            console.print(f"[red]error:[/red] {final.error}")
+        if final.result:
+            _render_research_result(final.result)
+
+    if state.json_output:
+        typer.echo(final.model_dump_json())
+    else:
+        render()
+    _exit_for_job(final)
 
 
 def main() -> None:
