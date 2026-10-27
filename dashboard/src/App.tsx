@@ -17,6 +17,7 @@ import {
 import NeuralGraph from "./components/NeuralGraph";
 import Sidebar from "./components/Sidebar";
 import { TaskQueue, ModelRouter, EventStream, KnowledgePanel } from "./components/Panels";
+import SearchPanel from "./components/SearchPanel";
 import PromptBar from "./components/PromptBar";
 
 /**
@@ -366,6 +367,7 @@ export default function App() {
 
       <aside className="right scroll-thin">
         <TaskQueue graph={graph} error={graphError} />
+        <SearchPanel />
         <ModelRouter usage={usage} error={dataError} />
         <KnowledgePanel activity={activity} error={dataError} />
         <EventStream events={events} connected={connected} />

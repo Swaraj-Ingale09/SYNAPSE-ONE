@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from synapse import __version__
 from synapse.api.auth import require_token
-from synapse.api.routers import dashboard, events, jobs, system
+from synapse.api.routers import dashboard, events, jobs, search, system
 from synapse.config import Settings, dashboard_dist_dir, get_settings
 from synapse.contracts import HealthOut, ReadyOut
 from synapse.db import check_database
@@ -80,6 +80,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     guarded = [Depends(require_token)]
     app.include_router(jobs.router, prefix="/v1/jobs", tags=["jobs"], dependencies=guarded)
     app.include_router(events.router, prefix="/v1/events", tags=["events"], dependencies=guarded)
+    app.include_router(
+        search.router, prefix="/v1/search", tags=["search"], dependencies=guarded
+    )
     app.include_router(system.router, prefix="/v1", tags=["system"], dependencies=guarded)
     app.include_router(
         dashboard.router, prefix="/v1", tags=["dashboard"], dependencies=guarded

@@ -230,3 +230,91 @@ def test_search_failure_prints_the_real_reason(isolated_env, monkeypatch) -> Non
     assert result.exit_code == 1
     assert "rate_limited" in result.output
     assert "wait 60s" in result.output
+
+
+# --- search --queue (durable job path, ADR 0008) --------------------------------------
+
+
+def test_search_queue_without_connector_or_query_is_an_honest_error(isolated_env) -> None:
+    """--queue with no arguments must say exactly what is missing — no silent catalog."""
+    result = runner.invoke(app, ["search", "--queue"])
+
+    assert result.exit_code == 1
+    assert "--queue" in result.output
+    assert "CONNECTOR" in result.output
+    assert "QUERY" in result.output
+
+
+def test_search_queue_with_connector_but_no_query_is_rejected(isolated_env) -> None:
+    result = runner.invoke(app, ["search", "github", "--queue"])
+
+    assert result.exit_code == 1
+    assert "QUERY" in result.output
+
+
+def test_search_queue_submits_a_durable_search_job_and_renders(
+    isolated_env, monkeypatch
+) -> None:
+    """--queue submits task "search" with the real payload and renders its result."""
+    import json
+    from dataclasses import asdict
+    from datetime import UTC, datetime
+
+    from synapse.connectors import RateLimit, ResultItem, SearchResponse
+    from synapse.contracts import Job, JobStatus
+
+    response = SearchResponse(
+        connector="github",
+        domain="coding",
+        query="rag",
+        requested=10,
+        page_size=10,
+        items=(
+            ResultItem(
+                title="pypa/sampleproject",
+                url="https://github.com/pypa/sampleproject",
+                date="2026-01-02T03:04:05Z",
+                snippet="Example project",
+                facts=(("stars", "42"), ("language", "n/a")),
+            ),
+        ),
+        total=None,  # provider reported no count — must render as n/a, never 0
+        fetched_at="2026-10-25T12:00:00+00:00",
+        rate=RateLimit(limit=10, remaining=9, source="headers"),
+    )
+    # The worker result reaches the CLI as JSON — lists, not tuples.
+    result_dict = json.loads(json.dumps(asdict(response)))
+    final = Job(
+        id="job-search-1",
+        task_type="search",
+        status=JobStatus.COMPLETED,
+        payload={},
+        result=result_dict,
+        user_scope="local",
+        correlation_id="corr-1",
+        attempts=1,
+        max_attempts=3,
+        cancel_requested=False,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    captured: dict = {}
+
+    def fake_submit(state, settings, task_type, payload, *, timeout, project):
+        captured.update(
+            task_type=task_type, payload=payload, timeout=timeout, project=project
+        )
+        return final
+
+    monkeypatch.setattr("synapse.cli.main._submit_and_wait", fake_submit)
+
+    result = runner.invoke(app, ["search", "github", "rag", "--queue"])
+
+    assert result.exit_code == 0
+    assert captured["task_type"] == "search"
+    assert captured["payload"] == {"connector": "github", "query": "rag", "limit": 10}
+    assert captured["project"] is None
+    assert "pypa/sampleproject" in result.output
+    assert "total n/a (this API reports no total)" in result.output  # null stays null
+    assert "9/10" in result.output
+    assert "language=n/a" in result.output

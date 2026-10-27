@@ -1,1 +1,1 @@
-"""API route modules: jobs, events, system."""
+"""API route modules: jobs, events, search, system."""

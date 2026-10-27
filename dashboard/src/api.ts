@@ -174,12 +174,53 @@ export interface JobEvent {
   metadata: Record<string, unknown>;
 }
 
+// --- search --------------------------------------------------------------------
+
+/** One entry in the connector catalog served by the core. */
+export interface ConnectorInfo {
+  name: string;
+  domain: string;
+  description: string;
+}
+
+/** One search result, exactly as the connector returned it. */
+export interface SearchItem {
+  title: string;
+  url: string | null;
+  date: string | null;
+  snippet: string | null;
+  /** Provider extras, e.g. ["stars", "120"]; may disclose truncation — render as-is. */
+  facts: [string, string][];
+}
+
+/** Provider rate-limit reading — a null limit/remaining means "not reported". */
+export interface SearchRate {
+  limit: number | null;
+  remaining: number | null;
+  source: string;
+}
+
+export interface SearchResult {
+  connector: string;
+  domain: string;
+  query: string;
+  requested: number;
+  page_size: number;
+  items: SearchItem[];
+  /** null = the provider reported no total (NOT "0 results"). */
+  total: number | null;
+  fetched_at: string;
+  rate: SearchRate | null;
+}
+
 // --- transport ----------------------------------------------------------------
 
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    /** Parsed response body when the server sent one (e.g. {detail: {reason, message}}). */
+    readonly body?: unknown,
   ) {
     super(message);
     this.name = "ApiError";
@@ -196,8 +237,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new ApiError(response.status, `${response.status} ${path}: ${body.slice(0, 200)}`);
+    const raw = await response.text().catch(() => "");
+    // Error bodies carry structured truth ({detail: {reason, message}}).
+    // Parse them when we can so the UI can show the real reason; parsing must
+    // never throw, so a non-JSON body degrades to null, not to a second error.
+    let body: unknown = null;
+    try {
+      body = raw ? (JSON.parse(raw) as unknown) : null;
+    } catch {
+      body = null;
+    }
+    throw new ApiError(response.status, `${response.status} ${path}: ${raw.slice(0, 200)}`, body);
   }
   return (await response.json()) as T;
 }
@@ -209,6 +259,13 @@ export const api = {
   usage: () => request<Usage>("/v1/dashboard/usage"),
   activity: () => request<Activity>("/v1/dashboard/activity"),
   events: (sinceId: number) => request<JobEvent[]>(`/v1/events?since_id=${sinceId}&limit=100`),
+  connectors: () => request<{ connectors: ConnectorInfo[] }>("/v1/search/connectors"),
+  search: (connector: string, query: string, limit = 10) =>
+    request<SearchResult>("/v1/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connector, query, limit }),
+    }),
 };
 
 /**

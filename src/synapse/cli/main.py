@@ -606,7 +606,7 @@ def _exit_for_job(job: Job) -> None:
 def submit(
     ctx: typer.Context,
     task_type: str = typer.Argument(
-        ..., help="Registered task type (echo, text_stats, slow, ask, ingest_url)"
+        ..., help="Registered task type (echo, text_stats, slow, ask, ingest_url, search)"
     ),
     data: str = typer.Option("{}", "--data", help="JSON payload, e.g. '{\"text\": \"hi\"}'"),
     data_file: Path | None = typer.Option(
@@ -1034,6 +1034,56 @@ def dashboard(ctx: typer.Context) -> None:
         err_console.print("[yellow]⚠ Could not launch a browser — open the URL manually.[/yellow]")
 
 
+def _render_search_result(result: dict[str, Any]) -> None:
+    """Render a search result dict (direct response or a queued job's result).
+
+    Reads only dict keys, so both paths share one renderer. Absences render as
+    "n/a"/absent — never as a fabricated 0. Facts may arrive as tuples (direct)
+    or lists (JSON round-trip through the job queue); both iterate the same.
+    """
+    total_value = result.get("total")
+    total = (
+        "total n/a (this API reports no total)"
+        if total_value is None
+        else f"total {total_value}"
+    )
+    items = result.get("items") or []
+    console.print(
+        f"[bold]{result.get('connector')}[/bold] ({result.get('domain')}) — "
+        f"{len(items)} shown · {total}"
+    )
+    requested = result.get("requested")
+    page_size = result.get("page_size")
+    if requested is not None and page_size is not None and requested > page_size:
+        console.print(
+            f"[yellow]·[/yellow] --limit {requested} trimmed to "
+            f"{page_size} (connector page cap)"
+        )
+    rate = result.get("rate")
+    if rate is None:
+        console.print("[dim]· rate limit: not reported by this API[/dim]")
+    else:
+        remaining = "n/a" if rate.get("remaining") is None else str(rate["remaining"])
+        ceiling = "n/a" if rate.get("limit") is None else str(rate["limit"])
+        console.print(
+            f"[dim]· rate limit: {remaining}/{ceiling} remaining "
+            f"(reported via {rate.get('source')})[/dim]"
+        )
+    for index, item in enumerate(items, start=1):
+        console.print(f"[cyan]{index}.[/cyan] {escape(str(item.get('title') or ''))}")
+        meta = " · ".join(part for part in (item.get("date"), item.get("url")) if part)
+        if meta:
+            console.print(f"   [dim]{escape(meta)}[/dim]")
+        if item.get("snippet"):
+            console.print(f"   {escape(item['snippet'])}")
+        facts = item.get("facts") or ()
+        if facts:
+            rendered = " · ".join(f"{key}={escape(value)}" for key, value in facts)
+            console.print(f"   [dim]{rendered}[/dim]")
+    if not items:
+        console.print("[dim]No results matched — an empty result, not an error.[/dim]")
+
+
 @app.command()
 def search(
     ctx: typer.Context,
@@ -1044,15 +1094,20 @@ def search(
         "", help="Search text (usgs takes key=value filters; frankfurter takes a currency code)"
     ),
     limit: int = typer.Option(10, "--limit", min=1, max=500, help="Max items to show"),
+    queue: bool = typer.Option(
+        False, "--queue", help="Queue a durable search job instead of calling the provider directly"
+    ),
+    timeout: float | None = typer.Option(None, "--timeout", help="Max seconds to wait for the job"),
 ) -> None:
     """Search a free public API: coding, knowledge, medical, earth, weather, finance.
 
     Runs directly against the verified provider through the SSRF gate — no core
-    required. Failures print the real reason (rate_limited, blocked, …), never
-    an empty-looking success.
+    required. With --queue it runs as a durable job on the core instead. Failures
+    print the real reason (rate_limited, blocked, …), never an empty-looking
+    success.
     """
     state = _state(ctx)
-    if connector is None:
+    if connector is None and not queue:
         def render_catalog() -> None:
             table = Table(title="Connectors — free public APIs")
             table.add_column("NAME", style="cyan")
@@ -1066,6 +1121,43 @@ def search(
         return
 
     settings = get_settings()
+    if queue:
+        # Same rule the worker enforces (tasks.search_task) — reject locally
+        # to save the round-trip. There is no "search everything" job.
+        if not connector or not query.strip():
+            err_console.print(
+                "[red]✗ --queue needs both a CONNECTOR and a QUERY argument[/red]"
+            )
+            raise typer.Exit(EXIT_ERROR)
+        final = _submit_and_wait(
+            state,
+            settings,
+            "search",
+            {"connector": connector, "query": query, "limit": limit},
+            timeout=timeout,
+            project=None,
+        )
+
+        def render_queued() -> None:
+            if final.status is not JobStatus.COMPLETED:
+                # Honest failure paths: no results, no invented partial answer.
+                color = "red" if final.status is JobStatus.FAILED else "yellow"
+                console.print(
+                    f"[{color}]{final.status.value.upper()}[/{color}] "
+                    f"job [bold]{final.id}[/bold]"
+                )
+            if final.error:
+                console.print(f"[red]error:[/red] {final.error}")
+            if final.result:
+                _render_search_result(final.result)
+
+        if state.json_output:
+            typer.echo(final.model_dump_json())
+        else:
+            render_queued()
+        _exit_for_job(final)
+        return
+
     try:
         with build_connector(connector, settings) as active:
             response = active.search(query, limit=limit)
@@ -1074,42 +1166,7 @@ def search(
         raise typer.Exit(EXIT_ERROR) from None
 
     def render() -> None:
-        total = (
-            "total n/a (this API reports no total)"
-            if response.total is None
-            else f"total {response.total}"
-        )
-        console.print(
-            f"[bold]{response.connector}[/bold] ({response.domain}) — "
-            f"{len(response.items)} shown · {total}"
-        )
-        if response.requested > response.page_size:
-            console.print(
-                f"[yellow]·[/yellow] --limit {response.requested} trimmed to "
-                f"{response.page_size} (connector page cap)"
-            )
-        rate = response.rate
-        if rate is None:
-            console.print("[dim]· rate limit: not reported by this API[/dim]")
-        else:
-            remaining = "n/a" if rate.remaining is None else str(rate.remaining)
-            ceiling = "n/a" if rate.limit is None else str(rate.limit)
-            console.print(
-                f"[dim]· rate limit: {remaining}/{ceiling} remaining "
-                f"(reported via {rate.source})[/dim]"
-            )
-        for index, item in enumerate(response.items, start=1):
-            console.print(f"[cyan]{index}.[/cyan] {escape(item.title)}")
-            meta = " · ".join(part for part in (item.date, item.url) if part)
-            if meta:
-                console.print(f"   [dim]{escape(meta)}[/dim]")
-            if item.snippet:
-                console.print(f"   {escape(item.snippet)}")
-            if item.facts:
-                rendered = " · ".join(f"{key}={escape(value)}" for key, value in item.facts)
-                console.print(f"   [dim]{rendered}[/dim]")
-        if not response.items:
-            console.print("[dim]No results matched — an empty result, not an error.[/dim]")
+        _render_search_result(asdict(response))
 
     _emit(state, asdict(response), render)
 

@@ -20,6 +20,7 @@ that a long-running task never holds row locks that would block cancellation.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import time
 from collections.abc import Callable
@@ -30,6 +31,7 @@ from typing import Any
 from sqlalchemy import select
 
 from synapse.config import Settings
+from synapse.connectors import ConnectorError, build_connector
 from synapse.db import session_scope
 from synapse.db.models import Job, utcnow
 from synapse.events import emit as _emit
@@ -523,10 +525,51 @@ def _store_in_knowledge(
 
 TaskFunc = Callable[[dict[str, Any], TaskContext], dict[str, Any]]
 
+# --- Phase 5: search over free public APIs (ADR 0008) --------------------------
+#
+# Same honesty rules as the connector layer itself: a failure keeps its stable
+# reason and real server detail, and ``total=None`` ("provider reported no
+# count") survives as null — distinct from a measured 0.
+
+SEARCH_DEFAULT_LIMIT = 10
+SEARCH_MAX_LIMIT = 100
+
+
+def search_task(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]:
+    """Search a free public API through a verified connector (ADR 0008).
+
+    The result is the connector's own :class:`SearchResponse` as a plain dict:
+    items, the provider's reported total (``None`` stays ``None``), and the
+    server-reported rate limit — nothing summarised, nothing invented.
+    """
+    name = payload.get("connector")
+    if not isinstance(name, str) or not name.strip():
+        raise TaskFailure("payload.connector must be a non-empty string")
+    query = payload.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise TaskFailure("payload.query must be a non-empty string (after strip)")
+
+    raw_limit = payload.get("limit", SEARCH_DEFAULT_LIMIT)
+    if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+        raise TaskFailure("payload.limit must be an integer between 1 and 100")
+    if not 1 <= raw_limit <= SEARCH_MAX_LIMIT:
+        raise TaskFailure("payload.limit must be an integer between 1 and 100")
+
+    ctx.ensure_not_cancelled()
+    try:
+        with build_connector(name, ctx.settings) as conn:
+            response = conn.search(query.strip(), limit=raw_limit)
+    except ConnectorError as exc:
+        # Stable reason prefix + the real detail — never swallowed, never faked.
+        raise TaskFailure(f"{exc.reason}: {exc.detail}") from None
+    return dataclasses.asdict(response)
+
+
 TASKS: dict[str, TaskFunc] = {
     "echo": echo_task,
     "text_stats": text_stats_task,
     "slow": slow_task,
     "ask": ask_task,
     "ingest_url": ingest_url_task,
+    "search": search_task,
 }
